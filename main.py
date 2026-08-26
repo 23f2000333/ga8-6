@@ -820,12 +820,13 @@ async def pipeline(request: Request):
     inputs = body["inputs"]
     events = body["events"]
 
-    # --------------------------------------------------------
-    # Create new session.
-    # --------------------------------------------------------
+    # ========================================================
+    # DETERMINE BASE STATE
+    # ========================================================
 
     if session_id not in sessions:
 
+        # Brand-new session.
         base = make_session(
             inputs,
             revision,
@@ -836,11 +837,15 @@ async def pipeline(request: Request):
         existing = sessions[session_id]
 
         # ----------------------------------------------------
-        # Same revision.
+        # Same revision
         # ----------------------------------------------------
 
         if revision == existing["revision"]:
 
+            # Inputs must be byte-for-byte equivalent under
+            # our compact canonical JSON representation.
+            #
+            # This includes EXTRA metadata as well.
             if (
                 compact_json(inputs)
                 != existing["inputSignature"]
@@ -852,52 +857,59 @@ async def pipeline(request: Request):
                     },
                 )
 
+            # Work from existing state.
+            base = copy.deepcopy(existing)
+
         # ----------------------------------------------------
-        # New revision.
+        # Newer revision
         # ----------------------------------------------------
 
         elif revision > existing["revision"]:
 
+            # Start with existing session so successful cache
+            # and immutable evidence survive.
             base = copy.deepcopy(existing)
 
+            # Replace revision inputs.
             base["revision"] = revision
             base["inputs"] = copy.deepcopy(inputs)
             base["inputSignature"] = compact_json(inputs)
 
-            # Clear ONLY current execution state.
+            # New revision gets fresh execution state.
             base["nodes"] = {
                 node: empty_node()
                 for node in NODES
             }
 
-            # IMPORTANT:
+            # DO NOT clear:
             #
-            # base["cache"] remains.
-            # base["evidence"] remains.
-            # base["events"] remains.
+            # base["cache"]
+            # base["evidence"]
+            # base["events"]
             #
-            # This is what allows successful content-addressed
-            # results from older revisions to be reused.
+            # Successful cache/evidence survives revisions.
 
         # ----------------------------------------------------
-        # Older revision request.
+        # Older revision
         # ----------------------------------------------------
 
         else:
 
-            # The current session state remains untouched.
-            # Old-revision events will simply be ignored.
+            # Keep current session state.
+            #
+            # Events belonging to an older revision are ignored
+            # later and do not consume their event IDs.
             base = copy.deepcopy(existing)
 
-    # New session case.
-    if session_id not in sessions:
-        pass
-    elif revision == sessions[session_id]["revision"]:
-        pass
-
-    # --------------------------------------------------------
-    # ATOMIC EVENT BATCH
-    # --------------------------------------------------------
+    # ========================================================
+    # ATOMIC EVENT PROCESSING
+    # ========================================================
+    #
+    # Everything happens against "working".
+    #
+    # If ANY event causes a 409, we return immediately and
+    # sessions[session_id] is never modified.
+    #
 
     working = copy.deepcopy(base)
 
@@ -906,7 +918,10 @@ async def pipeline(request: Request):
 
     for event in events:
 
-        # Structural invalidity is a batch conflict.
+        # ----------------------------------------------------
+        # Validate event structure.
+        # ----------------------------------------------------
+
         if not valid_event_shape(event):
             return JSONResponse(
                 status_code=409,
@@ -919,8 +934,15 @@ async def pipeline(request: Request):
         canonical_event = compact_json(event)
 
         # ----------------------------------------------------
-        # Global event ID.
+        # Global event ID handling.
         # ----------------------------------------------------
+        #
+        # Exact replay:
+        #   ignore
+        #
+        # Same ID + different content:
+        #   409 EVENT_ID_CONFLICT
+        #
 
         if event_id in working["events"]:
 
@@ -928,7 +950,6 @@ async def pipeline(request: Request):
                 working["events"][event_id]
                 == canonical_event
             ):
-                # Exact replay.
                 ignored_ids.append(event_id)
                 continue
 
@@ -940,26 +961,41 @@ async def pipeline(request: Request):
             )
 
         # ----------------------------------------------------
-        # Old revision = ignore.
+        # Older/wrong revision.
         #
-        # Crucially, ID is NOT consumed.
+        # IMPORTANT:
+        # Do NOT put this event into working["events"].
+        # Therefore it does not consume its ID.
         # ----------------------------------------------------
 
         if event["revision"] != working["revision"]:
+
             ignored_ids.append(event_id)
             continue
+
+        # ----------------------------------------------------
+        # State-machine transition.
+        # ----------------------------------------------------
 
         result = process_event(
             working,
             event,
         )
 
+        # ----------------------------------------------------
+        # Ignored event.
+        # ----------------------------------------------------
+
         if result == "ignored":
 
             ignored_ids.append(event_id)
 
-            # Ignored events do NOT consume event IDs.
+            # Ignored IDs are NOT consumed.
             continue
+
+        # ----------------------------------------------------
+        # Status conflict.
+        # ----------------------------------------------------
 
         if result == "status_conflict":
 
@@ -970,6 +1006,10 @@ async def pipeline(request: Request):
                 },
             )
 
+        # ----------------------------------------------------
+        # Immutable evidence conflict.
+        # ----------------------------------------------------
+
         if result == "evidence_conflict":
 
             return JSONResponse(
@@ -979,22 +1019,24 @@ async def pipeline(request: Request):
                 },
             )
 
-        # Accepted event consumes the ID.
-        working["events"][event_id] = (
-            canonical_event
-        )
+        # ----------------------------------------------------
+        # Accepted event.
+        #
+        # Only accepted events consume their IDs.
+        # ----------------------------------------------------
 
+        working["events"][event_id] = canonical_event
         accepted_ids.append(event_id)
 
-    # --------------------------------------------------------
+    # ========================================================
     # ATOMIC COMMIT
-    # --------------------------------------------------------
+    # ========================================================
 
     sessions[session_id] = working
 
-    # --------------------------------------------------------
-    # DAG response
-    # --------------------------------------------------------
+    # ========================================================
+    # RESPONSE
+    # ========================================================
 
     return {
         "revision": working["revision"],
