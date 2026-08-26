@@ -189,69 +189,31 @@ def cache_id(node, key):
 
 
 # ============================================================
-# REUSABLE ARTIFACT
+# CACHE / PARENT-GATED DEPENDENCIES
 # ============================================================
 
-def reusable_artifact(session, node):
+def current_success_artifact(session, node):
     """
-    A node's artifact is reusable when:
-
-    1. It succeeded in the current revision, OR
-    2. Its exact content-addressed cache entry exists.
-
-    For downstream nodes, its cache key is computed using the
-    parent's reusable artifact.
+    Artifact produced successfully in the CURRENT revision.
     """
-
     state = session["nodes"][node]
 
-    # Current revision success.
     if state["status"] == "succeeded":
         return state["artifactDigest"]
 
-    # Otherwise see if this node's content-addressed result
-    # exists in the persistent session cache.
-    key = compute_key(session, node)
-
-    if key is None:
-        return None
-
-    cached = session["cache"].get(
-        cache_id(node, key)
-    )
-
-    if cached is None:
-        return None
-
-    return cached["artifactDigest"]
+    return None
 
 
-# ============================================================
-# EXACT DEPENDENCY ARRAYS
-# ============================================================
-
-def dependency_array(session, node):
+def direct_dependency_array(session, node):
     """
-    EXACT arrays from the specification.
+    Build the exact dependency array.
 
-    verify_data:
-        [generation, checksum]
+    IMPORTANT:
+    This function does NOT calculate cache keys.
+    It only supplies the dependency values.
 
-    prepare:
-        [canonicalData, prepareCode, prepareConfig]
-
-    train:
-        [prepareArtifact, trainCode, trainConfig, runtime]
-
-    evaluate:
-        [trainArtifact, canonicalData,
-         evaluateCode, evaluateConfig]
-
-    register:
-        [evaluateArtifact, schemaDigest]
-
-    publish:
-        [registerArtifact, publishConfig]
+    The parent artifact is supplied separately by
+    reusable_artifact().
     """
 
     inputs = session["inputs"]
@@ -270,62 +232,62 @@ def dependency_array(session, node):
         ]
 
     if node == "train":
-        parent_artifact = reusable_artifact(
+        parent = reusable_artifact(
             session,
             "prepare",
         )
 
-        if parent_artifact is None:
+        if parent is None:
             return None
 
         return [
-            parent_artifact,
+            parent,
             inputs["trainCode"],
             inputs["trainConfig"],
             inputs["runtime"],
         ]
 
     if node == "evaluate":
-        parent_artifact = reusable_artifact(
+        parent = reusable_artifact(
             session,
             "train",
         )
 
-        if parent_artifact is None:
+        if parent is None:
             return None
 
         return [
-            parent_artifact,
+            parent,
             inputs["canonicalData"],
             inputs["evaluateCode"],
             inputs["evaluateConfig"],
         ]
 
     if node == "register":
-        parent_artifact = reusable_artifact(
+        parent = reusable_artifact(
             session,
             "evaluate",
         )
 
-        if parent_artifact is None:
+        if parent is None:
             return None
 
         return [
-            parent_artifact,
+            parent,
             inputs["schemaDigest"],
         ]
 
     if node == "publish":
-        parent_artifact = reusable_artifact(
+        parent = reusable_artifact(
             session,
             "register",
         )
 
-        if parent_artifact is None:
+        if parent is None:
             return None
 
         return [
-            parent_artifact,
+            parent,
             inputs["publishConfig"],
         ]
 
@@ -334,12 +296,16 @@ def dependency_array(session, node):
 
 def compute_key(session, node):
     """
-    Parent-gated content address.
+    Content-addressed key.
 
-    No parent artifact => downstream key is None.
+    Parent-gated:
+        no reusable parent -> None
+
+    Otherwise:
+        SHA256(UTF8(compact_json(exact_dependency_array)))
     """
 
-    deps = dependency_array(
+    deps = direct_dependency_array(
         session,
         node,
     )
@@ -347,19 +313,67 @@ def compute_key(session, node):
     if deps is None:
         return None
 
-    return sha256_compact_array(deps)
+    encoded = json.dumps(
+        deps,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    return hashlib.sha256(encoded).hexdigest()
 
 
-def cache_hit(session, node):
-    key = compute_key(session, node)
+def cached_entry(session, node):
+    """
+    Look up only the exact node/key pair.
+    """
+
+    key = compute_key(
+        session,
+        node,
+    )
 
     if key is None:
         return None
 
     return session["cache"].get(
-        cache_id(node, key)
+        (node, key)
     )
 
+
+def reusable_artifact(session, node):
+    """
+    A node is reusable if:
+
+      1. It succeeded in this revision, OR
+      2. Its exact successful cache entry exists.
+
+    This is intentionally node-local.
+    """
+
+    current = current_success_artifact(
+        session,
+        node,
+    )
+
+    if current is not None:
+        return current
+
+    cached = cached_entry(
+        session,
+        node,
+    )
+
+    if cached is None:
+        return None
+
+    return cached["artifactDigest"]
+
+
+def cache_hit(session, node):
+    return cached_entry(
+        session,
+        node,
+    )
 
 # ============================================================
 # DEPENDENCY DIGEST RESPONSE
@@ -371,85 +385,68 @@ def dependency_digests(session, node, key):
     result = {}
 
     if node == "verify_data":
-
         result["generation"] = sha256_string(
             inputs["generation"]
         )
-
         result["checksum"] = sha256_string(
             inputs["checksum"]
         )
 
     elif node == "prepare":
-
         result["canonicalData"] = sha256_string(
             inputs["canonicalData"]
         )
-
         result["prepareCode"] = sha256_string(
             inputs["prepareCode"]
         )
-
         result["prepareConfig"] = sha256_string(
             inputs["prepareConfig"]
         )
 
     elif node == "train":
-
         result["prepareArtifact"] = reusable_artifact(
             session,
             "prepare",
         )
-
         result["trainCode"] = sha256_string(
             inputs["trainCode"]
         )
-
         result["trainConfig"] = sha256_string(
             inputs["trainConfig"]
         )
-
         result["runtime"] = sha256_string(
             inputs["runtime"]
         )
 
     elif node == "evaluate":
-
         result["trainArtifact"] = reusable_artifact(
             session,
             "train",
         )
-
         result["canonicalData"] = sha256_string(
             inputs["canonicalData"]
         )
-
         result["evaluateCode"] = sha256_string(
             inputs["evaluateCode"]
         )
-
         result["evaluateConfig"] = sha256_string(
             inputs["evaluateConfig"]
         )
 
     elif node == "register":
-
         result["evaluateArtifact"] = reusable_artifact(
             session,
             "evaluate",
         )
-
         result["schemaDigest"] = sha256_string(
             inputs["schemaDigest"]
         )
 
     elif node == "publish":
-
         result["registerArtifact"] = reusable_artifact(
             session,
             "register",
         )
-
         result["publishConfig"] = sha256_string(
             inputs["publishConfig"]
         )
@@ -457,7 +454,6 @@ def dependency_digests(session, node, key):
     result["cacheKey"] = key
 
     return result
-
 
 # ============================================================
 # EVENT STRUCTURE VALIDATION
@@ -894,7 +890,7 @@ def make_node_response(session, node):
 
         parent_state = session["nodes"][parent]
 
-        # A parent terminal failure propagates downstream.
+        # Parent has terminally failed.
         if parent_state["status"] == "terminal_failed":
 
             return {
@@ -909,15 +905,18 @@ def make_node_response(session, node):
                 ],
             }
 
-        # Parent must be reusable before this node can have a key.
-        if reusable_artifact(
+        # Parent is reusable through either:
+        #   current success
+        #   OR cache
+        parent_artifact = reusable_artifact(
             session,
             parent,
-        ) is None:
+        )
+
+        if parent_artifact is None:
 
             triggering = []
 
-            # A pending/running parent can expose its start event.
             if parent_state["startEventId"] is not None:
                 triggering = [
                     parent_state["startEventId"]
